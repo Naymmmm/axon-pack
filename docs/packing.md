@@ -43,8 +43,9 @@ Useful related flags:
 - `--group-size`
 - `--outlier-sigma`
 - `--no-vq`
-- `--jobs`
-- `--gpu`
+- `--jobs` (default `6`)
+- GPU packing is preferred by default when PyTorch/CUDA is available
+- `--no-gpu`
 
 ## AXON v2 Features
 

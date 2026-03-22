@@ -124,7 +124,7 @@ def _prepare_speculative_draft(args: argparse.Namespace, workspace: Path) -> dic
         boot_cutoff_layers=args.boot_cutoff_layers,
         expert_dedup_threshold=None,
         jobs=args.jobs,
-        prefer_gpu=args.gpu,
+        prefer_gpu=not args.no_gpu,
     )
     draft_plan_path = draft_workspace / "draft-plan.json"
     draft_plan_path.write_text(json.dumps(draft_plan, indent=2), encoding="utf-8")
@@ -181,7 +181,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
             if args.lora_targets
             else None,
             jobs=args.jobs,
-            prefer_gpu=args.gpu,
+            prefer_gpu=not args.no_gpu,
         )
         plan_path = workspace / "build-plan.json"
         plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
@@ -255,13 +255,13 @@ def build_parser() -> argparse.ArgumentParser:
     pack_parser.add_argument(
         "--jobs",
         type=int,
-        default=None,
-        help="Tensor packing worker count. Defaults to an automatic value based on CPU count.",
+        default=6,
+        help="Tensor packing worker count. Defaults to 6.",
     )
     pack_parser.add_argument(
-        "--gpu",
+        "--no-gpu",
         action="store_true",
-        help="Use CUDA-accelerated quantization through PyTorch when available.",
+        help="Disable CUDA-accelerated quantization. GPU packing is preferred by default when PyTorch/CUDA is available.",
     )
     pack_parser.add_argument(
         "--boot-cutoff-layers",

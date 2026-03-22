@@ -54,8 +54,7 @@ Pack a local Hugging Face model into the shared AXON library:
 PYTHONPATH=python python3 -m axon_pack.cli pack \
   --input /path/to/model \
   --source-format hf \
-  --name my-model \
-  --jobs 8
+  --name my-model
 ```
 
 Pack to an explicit output directory:
@@ -110,8 +109,9 @@ More detail: [docs/packing.md](/home/oscar/Repos/axon-pack/docs/packing.md)
 
 Useful performance flags:
 
-- `--jobs`: parallel tensor packing worker count
-- `--gpu`: enable CUDA-backed quantization through PyTorch when available
+- `--jobs`: parallel tensor packing worker count, default `6`
+- GPU packing is preferred by default when PyTorch/CUDA is available
+- `--no-gpu`: force CPU-only packing
 
 ## Output Layout
 

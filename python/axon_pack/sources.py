@@ -1647,8 +1647,8 @@ def build_plan(
     lora_rank: int = 16,
     lora_alpha: int = 32,
     lora_target_modules: list[str] | None = None,
-    jobs: int | None = None,
-    prefer_gpu: bool = False,
+    jobs: int | None = 6,
+    prefer_gpu: bool = True,
 ) -> dict[str, Any]:
     print(
         f"[axon-pack] building plan from {input_path} ({source_format}, quantization={quantization})",
