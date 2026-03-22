@@ -43,6 +43,8 @@ Useful related flags:
 - `--group-size`
 - `--outlier-sigma`
 - `--no-vq`
+- `--jobs`
+- `--gpu`
 
 ## AXON v2 Features
 

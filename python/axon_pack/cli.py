@@ -123,6 +123,8 @@ def _prepare_speculative_draft(args: argparse.Namespace, workspace: Path) -> dic
         enable_vq=not args.no_vq,
         boot_cutoff_layers=args.boot_cutoff_layers,
         expert_dedup_threshold=None,
+        jobs=args.jobs,
+        prefer_gpu=args.gpu,
     )
     draft_plan_path = draft_workspace / "draft-plan.json"
     draft_plan_path.write_text(json.dumps(draft_plan, indent=2), encoding="utf-8")
@@ -178,6 +180,8 @@ def cmd_pack(args: argparse.Namespace) -> int:
             lora_target_modules=[value.strip() for value in args.lora_targets.split(",") if value.strip()]
             if args.lora_targets
             else None,
+            jobs=args.jobs,
+            prefer_gpu=args.gpu,
         )
         plan_path = workspace / "build-plan.json"
         plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
@@ -247,6 +251,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-vq",
         action="store_true",
         help="Disable VQ for embedding and lm_head tensors.",
+    )
+    pack_parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Tensor packing worker count. Defaults to an automatic value based on CPU count.",
+    )
+    pack_parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use CUDA-accelerated quantization through PyTorch when available.",
     )
     pack_parser.add_argument(
         "--boot-cutoff-layers",

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -12,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency
+    torch = None
 
 
 SAFE_TENSOR_DTYPES = {
@@ -75,6 +82,8 @@ class PackOptions:
     enable_vq: bool
     boot_cutoff_layers: int | None
     expert_dedup_threshold: float | None
+    jobs: int | None
+    prefer_gpu: bool
 
 
 def _utc_now() -> str:
@@ -127,6 +136,34 @@ def _format_bytes(value: int) -> str:
     if value >= kib:
         return f"{value / kib:.1f} KiB"
     return f"{value} B"
+
+
+def _default_parallel_jobs(total_items: int) -> int:
+    if total_items <= 1:
+        return 1
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(total_items, cpu_count, 8))
+
+
+def _effective_pack_jobs(total_tensors: int, options: PackOptions) -> int:
+    requested = options.jobs or _default_parallel_jobs(total_tensors)
+    if requested < 1:
+        return 1
+    if options.prefer_gpu and _torch_cuda_available():
+        return 1
+    return min(total_tensors, requested)
+
+
+def _torch_cuda_available() -> bool:
+    return bool(torch is not None and torch.cuda.is_available())
+
+
+def _gpu_quantization_enabled(options: PackOptions, tensor: TensorSlice, weights: np.ndarray) -> bool:
+    if not options.prefer_gpu or not _torch_cuda_available():
+        return False
+    if tensor.dtype not in {"fp16", "bf16", "fp32"}:
+        return False
+    return weights.size >= 1_000_000
 
 
 def _is_tokenizer_asset(name: str) -> bool:
@@ -1065,6 +1102,39 @@ def _extract_outliers(weights: np.ndarray, sigma: float) -> tuple[np.ndarray, by
     return residual.reshape(weights.shape), payload, nnz
 
 
+def _extract_outliers_torch(weights: np.ndarray, sigma: float) -> tuple[np.ndarray, bytes | None, int]:
+    if weights.ndim < 2:
+        return weights, None, 0
+    device = torch.device("cuda")
+    rows_np = weights.reshape(weights.shape[0], -1).astype(np.float32, copy=False)
+    rows = torch.from_numpy(rows_np).to(device=device, dtype=torch.float32)
+    row_mean = rows.mean(dim=1, keepdim=True)
+    row_std = rows.std(dim=1, keepdim=True, unbiased=False)
+    threshold = row_mean.abs() + (sigma * row_std)
+    mask = rows.abs() > threshold
+    if not bool(mask.any().item()):
+        return weights, None, 0
+
+    residual = rows.masked_fill(mask, 0.0).cpu().numpy()
+    mask_np = mask.cpu().numpy()
+    row_ptr = np.zeros(rows_np.shape[0] + 1, dtype="<u4")
+    col_indices: list[np.ndarray] = []
+    values: list[np.ndarray] = []
+    nnz = 0
+    for row_index in range(rows_np.shape[0]):
+        indices = np.nonzero(mask_np[row_index])[0].astype(np.uint32)
+        row_ptr[row_index] = nnz
+        if indices.size:
+            col_indices.append(indices.astype("<u4", copy=False))
+            values.append(rows_np[row_index, indices].astype("<f2"))
+            nnz += int(indices.size)
+    row_ptr[-1] = nnz
+    col_idx_bytes = b"".join(index_array.tobytes(order="C") for index_array in col_indices)
+    value_bytes = b"".join(value_array.tobytes(order="C") for value_array in values)
+    payload = row_ptr.tobytes(order="C") + col_idx_bytes + value_bytes
+    return residual.reshape(weights.shape), payload, nnz
+
+
 def _mxq_pack(weights: np.ndarray, bits: int, group_size: int, outlier_sigma: float) -> tuple[bytes, bytes | None, int]:
     residual, outlier_payload, outlier_count = _extract_outliers(weights.astype(np.float32), outlier_sigma)
     flat = residual.astype(np.float32, copy=False).reshape(-1)
@@ -1090,6 +1160,41 @@ def _mxq_pack(weights: np.ndarray, bits: int, group_size: int, outlier_sigma: fl
         codes = np.clip(quantized, 0, (1 << bits) - 1).astype(np.uint8)
     packed = _pack_codes(codes, bits)
     scale_bytes = scales.astype("<f2").view(np.uint8).reshape(groups, 2)
+    payload = bytearray()
+    for group_index in range(groups):
+        payload.extend(scale_bytes[group_index].tobytes(order="C"))
+        payload.extend(packed[group_index].tobytes(order="C"))
+    return bytes(payload), outlier_payload, outlier_count
+
+
+def _mxq_pack_torch(weights: np.ndarray, bits: int, group_size: int, outlier_sigma: float) -> tuple[bytes, bytes | None, int]:
+    residual, outlier_payload, outlier_count = _extract_outliers_torch(weights.astype(np.float32), outlier_sigma)
+    flat = residual.astype(np.float32, copy=False).reshape(-1)
+    if flat.size == 0:
+        return b"", outlier_payload, outlier_count
+    device = torch.device("cuda")
+    flat_tensor = torch.from_numpy(flat).to(device=device, dtype=torch.float32)
+    groups = math.ceil(flat.size / group_size)
+    padded_size = groups * group_size
+    if padded_size != flat.size:
+        padded = torch.zeros(padded_size, device=device, dtype=torch.float32)
+        padded[: flat.size] = flat_tensor
+        flat_tensor = padded
+    grouped = flat_tensor.reshape(groups, group_size)
+    max_level = float((1 << (bits - 1)) - 1) if bits > 1 else 1.0
+    scales = grouped.abs().amax(dim=1)
+    nonzero = scales > 0
+    scales = torch.where(nonzero, scales / max_level, torch.zeros_like(scales))
+    zero_point = 1 << (bits - 1)
+    codes = torch.full(grouped.shape, zero_point, device=device, dtype=torch.int32)
+    if bool(nonzero.any().item()):
+        normalized = torch.zeros_like(grouped)
+        normalized[nonzero] = grouped[nonzero] / scales[nonzero].unsqueeze(1)
+        quantized = torch.round(normalized).to(torch.int32) + zero_point
+        codes = torch.clamp(quantized, 0, (1 << bits) - 1)
+    codes_np = codes.to(dtype=torch.uint8).cpu().numpy()
+    packed = _pack_codes(codes_np, bits)
+    scale_bytes = scales.to(dtype=torch.float16).cpu().numpy().astype("<f2", copy=False).view(np.uint8).reshape(groups, 2)
     payload = bytearray()
     for group_index in range(groups):
         payload.extend(scale_bytes[group_index].tobytes(order="C"))
@@ -1126,6 +1231,36 @@ def _nf_pack(weights: np.ndarray, bits: int, group_size: int, outlier_sigma: flo
     codes = distances.argmin(axis=2).astype(np.uint8)
     packed = _pack_codes(codes, bits)
     scale_bytes = scales.astype("<f2").view(np.uint8).reshape(groups, 2)
+    payload = bytearray()
+    for group_index in range(groups):
+        payload.extend(scale_bytes[group_index].tobytes(order="C"))
+        payload.extend(packed[group_index].tobytes(order="C"))
+    return bytes(payload), outlier_payload, outlier_count
+
+
+def _nf_pack_torch(weights: np.ndarray, bits: int, group_size: int, outlier_sigma: float) -> tuple[bytes, bytes | None, int]:
+    residual, outlier_payload, outlier_count = _extract_outliers_torch(weights.astype(np.float32), outlier_sigma)
+    flat = residual.astype(np.float32, copy=False).reshape(-1)
+    if flat.size == 0:
+        return b"", outlier_payload, outlier_count
+    device = torch.device("cuda")
+    flat_tensor = torch.from_numpy(flat).to(device=device, dtype=torch.float32)
+    groups = math.ceil(flat.size / group_size)
+    padded_size = groups * group_size
+    if padded_size != flat.size:
+        padded = torch.zeros(padded_size, device=device, dtype=torch.float32)
+        padded[: flat.size] = flat_tensor
+        flat_tensor = padded
+    grouped = flat_tensor.reshape(groups, group_size)
+    scales = grouped.abs().amax(dim=1)
+    nonzero = scales > 0
+    normalized = torch.zeros_like(grouped)
+    normalized[nonzero] = grouped[nonzero] / scales[nonzero].unsqueeze(1)
+    levels = torch.tensor(_nf_levels(bits), device=device, dtype=torch.float32)
+    distances = (normalized.unsqueeze(-1) - levels.view(1, 1, -1)).abs()
+    codes = distances.argmin(dim=2).to(dtype=torch.uint8).cpu().numpy()
+    packed = _pack_codes(codes, bits)
+    scale_bytes = scales.to(dtype=torch.float16).cpu().numpy().astype("<f2", copy=False).view(np.uint8).reshape(groups, 2)
     payload = bytearray()
     for group_index in range(groups):
         payload.extend(scale_bytes[group_index].tobytes(order="C"))
@@ -1427,11 +1562,26 @@ def _tensor_payload_plan(
             None,
         )
     group_size = _preferred_group_size(model, options.group_size)
+    use_gpu = _gpu_quantization_enabled(options, tensor, weights)
     if bits in {2, 3}:
-        packed_payload, outlier_payload, outlier_count = _nf_pack(weights, bits, group_size, options.outlier_sigma)
+        if use_gpu:
+            packed_payload, outlier_payload, outlier_count = _nf_pack_torch(
+                weights, bits, group_size, options.outlier_sigma
+            )
+        else:
+            packed_payload, outlier_payload, outlier_count = _nf_pack(
+                weights, bits, group_size, options.outlier_sigma
+            )
         quant_dtype = "axon_nf2" if bits == 2 else "axon_nf3"
     else:
-        packed_payload, outlier_payload, outlier_count = _mxq_pack(weights, bits, group_size, options.outlier_sigma)
+        if use_gpu:
+            packed_payload, outlier_payload, outlier_count = _mxq_pack_torch(
+                weights, bits, group_size, options.outlier_sigma
+            )
+        else:
+            packed_payload, outlier_payload, outlier_count = _mxq_pack(
+                weights, bits, group_size, options.outlier_sigma
+            )
         quant_dtype = "axon_mxq"
     descriptor.update(
         {
@@ -1497,6 +1647,8 @@ def build_plan(
     lora_rank: int = 16,
     lora_alpha: int = 32,
     lora_target_modules: list[str] | None = None,
+    jobs: int | None = None,
+    prefer_gpu: bool = False,
 ) -> dict[str, Any]:
     print(
         f"[axon-pack] building plan from {input_path} ({source_format}, quantization={quantization})",
@@ -1521,6 +1673,8 @@ def build_plan(
         enable_vq=enable_vq,
         boot_cutoff_layers=boot_cutoff_layers,
         expert_dedup_threshold=expert_dedup_threshold,
+        jobs=jobs,
+        prefer_gpu=prefer_gpu,
     )
 
     if source_format == "hf":
@@ -1571,21 +1725,83 @@ def build_plan(
     codebook_sources: dict[str, Any] = {}
     expert_dedup_sources: dict[str, Any] = {}
     total_tensors = len(tensors)
-
-    for stream_order, tensor in enumerate(tensors):
+    pack_jobs = _effective_pack_jobs(total_tensors, options)
+    if options.prefer_gpu and not _torch_cuda_available():
         print(
-            f"[axon-pack] tensor {stream_order + 1}/{total_tensors}: {tensor.name} "
-            f"({tensor.dtype}, {_format_bytes(tensor.length)})",
+            "[axon-pack] CUDA packing requested, but PyTorch/CUDA is unavailable; falling back to CPU packing",
             file=sys.stderr,
             flush=True,
         )
-        descriptor, data_source, outlier_source, codebook_entry = _tensor_payload_plan(
-            tensor=tensor,
-            model=model,
-            stream_order=stream_order,
-            workspace=workspace,
-            options=options,
+    if total_tensors and pack_jobs > 1:
+        print(
+            f"[axon-pack] packing tensors with {pack_jobs} worker(s)",
+            file=sys.stderr,
+            flush=True,
         )
+    elif options.prefer_gpu:
+        if _torch_cuda_available():
+            print("[axon-pack] packing tensors with CUDA-accelerated quantization", file=sys.stderr, flush=True)
+
+    if total_tensors == 0:
+        tensor_results: dict[int, tuple[TensorSlice, dict[str, Any], dict[str, Any], dict[str, Any] | None, tuple[str, dict[str, Any], dict[str, Any]] | None]] = {}
+    elif pack_jobs <= 1:
+        tensor_results = {}
+        for stream_order, tensor in enumerate(tensors):
+            print(
+                f"[axon-pack] tensor {stream_order + 1}/{total_tensors}: {tensor.name} "
+                f"({tensor.dtype}, {_format_bytes(tensor.length)})",
+                file=sys.stderr,
+                flush=True,
+            )
+            descriptor, data_source, outlier_source, codebook_entry = _tensor_payload_plan(
+                tensor=tensor,
+                model=model,
+                stream_order=stream_order,
+                workspace=workspace,
+                options=options,
+            )
+            tensor_results[stream_order] = (
+                tensor,
+                descriptor,
+                data_source,
+                outlier_source,
+                codebook_entry,
+            )
+    else:
+        tensor_results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=pack_jobs) as executor:
+            future_map = {
+                executor.submit(
+                    _tensor_payload_plan,
+                    tensor=tensor,
+                    model=model,
+                    stream_order=stream_order,
+                    workspace=workspace,
+                    options=options,
+                ): (stream_order, tensor)
+                for stream_order, tensor in enumerate(tensors)
+            }
+            completed = 0
+            for future in concurrent.futures.as_completed(future_map):
+                stream_order, tensor = future_map[future]
+                descriptor, data_source, outlier_source, codebook_entry = future.result()
+                completed += 1
+                print(
+                    f"[axon-pack] tensor {completed}/{total_tensors}: {tensor.name} "
+                    f"({tensor.dtype}, {_format_bytes(tensor.length)})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                tensor_results[stream_order] = (
+                    tensor,
+                    descriptor,
+                    data_source,
+                    outlier_source,
+                    codebook_entry,
+                )
+
+    for stream_order in range(total_tensors):
+        tensor, descriptor, data_source, outlier_source, codebook_entry = tensor_results[stream_order]
         tensor_map[tensor.name] = descriptor
         tensor_sources[tensor.name] = data_source
         if outlier_source is not None:
